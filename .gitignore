@@ -1,0 +1,6 @@
+# 编译产物（安装包通过 GitHub Release 发布）
+App/build/
+App/tools/winid
+*.dmg
+*.zip
+.DS_Store
