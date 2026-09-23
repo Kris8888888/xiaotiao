@@ -14,16 +14,17 @@ final class AppState: ObservableObject {
     private var clockTimer: Timer?
     private var mouseMonitor: Any?
     private var settingsWindow: NSWindow?
+    private var settingsCloseObserver: NSObjectProtocol?
     private var cancellables: Set<AnyCancellable> = []
     @Published var lastError: String? = nil
-    @Published var lastUpdate: Date? = nil
+    var lastUpdate: Date? = nil   // 只给菜单用，不发通知，免得设置窗口每秒跟着重排
     @Published var visible = true
     /// 连续失败次数，用来自动退避：1 秒 → 3 秒 → 10 秒 → 30 秒，恢复后回到设定值
     private var failures = 0
 
     var settings: AppSettings {
         get { model.settings }
-        set { model.settings = newValue; newValue.save(); settingsChanged() }
+        set { let old = model.settings; model.settings = newValue; newValue.save(); settingsChanged(from: old, to: newValue) }
     }
 
     private var autoHidden = false          // 因为会议类应用到前台而自动藏起来的
@@ -32,6 +33,9 @@ final class AppState: ObservableObject {
     private init() {
         model.settings = AppSettings.load()
         model.onTap = { [weak self] sym in self?.openQuotePage(sym) }
+        // 设置变了才通知观察 AppState 的界面（设置窗口）；行情、时钟这些每秒的变化不打扰它
+        model.$settings.dropFirst().removeDuplicates()
+            .sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &cancellables)
     }
 
     func start() {
@@ -149,13 +153,17 @@ final class AppState: ObservableObject {
 
     // MARK: 设置变更
 
-    private func settingsChanged() {
+    /// 只做跟这次改动有关的事。设置页里每敲一个字都会走到这里，
+    /// 以前不分青红皂白地重注册快捷键、问系统登录启动状态（同步 XPC）、发一次行情请求，
+    /// 输入框就跟着一顿一顿的。
+    private func settingsChanged(from old: AppSettings, to new: AppSettings) {
         overlay.applyInteraction()
-        registerHotKeys()
-        applyLaunchAtLogin()
+        if old.toggleHotKey != new.toggleHotKey || old.disguiseHotKey != new.disguiseHotKey { registerHotKeys() }
+        if old.launchAtLogin != new.launchAtLogin { applyLaunchAtLogin() }
         refreshMenu()
-        scheduleNext()
-        refresh()
+        let oldKeys = old.symbols.map { $0.tencentKey }, newKeys = new.symbols.map { $0.tencentKey }
+        if oldKeys != newKeys || old.fastInterval != new.fastInterval || old.slowInterval != new.slowInterval { scheduleNext() }
+        if oldKeys != newKeys { refresh() }
     }
 
     // MARK: 行情
@@ -188,7 +196,7 @@ final class AppState: ObservableObject {
                         self.model.settings = s; s.save()
                     }
                 }
-                self.lastError = err
+                if self.lastError != err { self.lastError = err }
                 self.failures = quotes.isEmpty ? self.failures + 1 : 0
                 self.refreshMenu()
             }
@@ -322,6 +330,15 @@ final class AppState: ObservableObject {
             w.isReleasedWhenClosed = false
             w.center()
             settingsWindow = w
+            // 关窗就把里面的 SwiftUI 视图拆掉、窗口丢掉，下次打开重建。
+            // 不拆的话它会躲在后台跟着每秒的行情刷新反复重排，TabView 每排一次都漏一点内存，
+            // 跑一天主线程就被它吃满，右键菜单要等很久才出来。
+            settingsCloseObserver = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak self] _ in
+                guard let self = self else { return }
+                self.settingsWindow?.contentView = nil
+                self.settingsWindow = nil
+                if let o = self.settingsCloseObserver { NotificationCenter.default.removeObserver(o); self.settingsCloseObserver = nil }
+            }
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)

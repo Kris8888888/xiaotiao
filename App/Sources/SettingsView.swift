@@ -3,12 +3,13 @@ import AppKit
 
 /// 设置：改动即时生效
 struct SettingsView: View {
+    // 只观察 AppState：它在设置变化时才通知。不直接观察 TickerModel，
+    // 否则每秒的时钟/行情更新都会让整个 TabView 重排，而 TabView 每重排一次都会漏一点内存。
     @ObservedObject var state: AppState
-    @ObservedObject var model: TickerModel
 
     @State private var tab: Int = Int(ProcessInfo.processInfo.environment["XIAOTIAO_DEMO_TAB"] ?? "") ?? 0
 
-    init(state: AppState) { self.state = state; self.model = state.model }
+    init(state: AppState) { self.state = state }
 
     var s: Binding<AppSettings> {
         Binding(get: { state.model.settings }, set: { state.settings = $0 })
@@ -16,7 +17,7 @@ struct SettingsView: View {
 
     var body: some View {
         TabView(selection: $tab) {
-            StocksTab(state: state, s: s).tabItem { Label("股票", systemImage: "list.bullet") }.tag(0)
+            StocksTab(state: state, model: state.model, s: s).tabItem { Label("股票", systemImage: "list.bullet") }.tag(0)
             LookTab(s: s).tabItem { Label("外观", systemImage: "paintbrush") }.tag(1)
             StealthTab(s: s).tabItem { Label("隐蔽", systemImage: "eye.slash") }.tag(2)
             GeneralTab(state: state, s: s).tabItem { Label("通用", systemImage: "gearshape") }.tag(3)
@@ -30,6 +31,7 @@ struct SettingsView: View {
 
 struct StocksTab: View {
     @ObservedObject var state: AppState
+    @ObservedObject var model: TickerModel   // 现价列要跟着行情动，只有这一页观察它
     var s: Binding<AppSettings>
     @State private var input = ""
     @State private var message = ""
@@ -50,21 +52,26 @@ struct StocksTab: View {
                                 Text(sym.name.isEmpty ? sym.code : sym.name).font(.system(size: 13, weight: .medium)).lineLimit(1)
                                 Text(sym.code).font(.system(size: 11)).foregroundStyle(.secondary)
                             }
-                            .frame(width: 128, alignment: .leading)
-                            TextField("代号", text: $sym.alias, prompt: Text("代号")).textFieldStyle(.roundedBorder).frame(width: 64)
-                            Text("提醒").font(.system(size: 11)).foregroundStyle(.secondary).padding(.leading, 4)
-                            OptionalNumberField(prompt: "高于", value: $sym.alertHigh).frame(width: 66)
-                            OptionalNumberField(prompt: "低于", value: $sym.alertLow).frame(width: 66)
+                            .frame(width: 116, alignment: .leading)
+                            TextField("代号", text: $sym.alias, prompt: Text("代号")).textFieldStyle(.roundedBorder).frame(width: 56)
+                            OptionalNumberField(prompt: "高于", value: $sym.alertHigh).frame(width: 62)
+                            OptionalNumberField(prompt: "低于", value: $sym.alertLow).frame(width: 62)
                             Spacer(minLength: 6)
-                            if let q = state.model.quotes[sym.tencentKey] {
+                            if let q = model.quotes[sym.tencentKey] {
                                 Text(String(format: "%.2f  %+.2f%%", q.price, q.pct)).font(.system(size: 12)).monospacedDigit().foregroundStyle(.secondary)
                                     .lineLimit(1).fixedSize()
                             }
-                            Button { s.wrappedValue.symbols.removeAll { $0.id == sym.id } } label: { Image(systemName: "minus.circle") }.buttonStyle(.plain).foregroundStyle(.secondary)
+                            // 排序用按钮而不用拖动：列表一旦能拖，系统每次按下都要先等半秒多判断是不是在拖，
+                            // 输入框点了要 1 秒左右才能打字。
+                            let idx = s.wrappedValue.symbols.firstIndex { $0.id == sym.id } ?? 0
+                            Button { move(sym.id, by: -1) } label: { Image(systemName: "chevron.up") }.buttonStyle(.plain).foregroundStyle(.secondary)
+                                .disabled(idx == 0).help("上移")
+                            Button { move(sym.id, by: 1) } label: { Image(systemName: "chevron.down") }.buttonStyle(.plain).foregroundStyle(.secondary)
+                                .disabled(idx >= s.wrappedValue.symbols.count - 1).help("下移")
+                            Button { s.wrappedValue.symbols.removeAll { $0.id == sym.id } } label: { Image(systemName: "minus.circle") }.buttonStyle(.plain).foregroundStyle(.secondary).padding(.leading, 4)
                         }
                         .padding(.vertical, 2)
                     }
-                    .onMove { from, to in s.wrappedValue.symbols.move(fromOffsets: from, toOffset: to) }
                 }
                 .frame(minHeight: 200)
                 HStack {
@@ -92,8 +99,8 @@ struct StocksTab: View {
                     }
                 }
                 if !message.isEmpty { Text(message).font(.caption).foregroundStyle(message.hasPrefix("已添加") ? .secondary : Color.red) }
-            } header: { Text("自选股（拖动可排序）") } footer: {
-                Text("填代码或者直接打名字都行：A 股 6 位数字自动判断沪深，美股字母代码；打「茅台」「apple」会出候选。「提醒」两格填价格，现价高于或低于它时通知你，留空不提醒。").font(.caption).foregroundStyle(.secondary)
+            } header: { Text("自选股") } footer: {
+                Text("填代码或者直接打名字都行：A 股 6 位数字自动判断沪深，美股字母代码；打「茅台」「apple」会出候选。「提醒」两格填价格，现价高于或低于它时通知你，留空不提醒。右侧 ∧∨ 调整顺序。").font(.caption).foregroundStyle(.secondary)
             }
             Section("刷新") {
                 Stepper("交易时段每 \(Int(s.wrappedValue.fastInterval)) 秒刷一次", value: s.fastInterval, in: 1...60)
@@ -102,6 +109,13 @@ struct StocksTab: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    func move(_ id: UUID, by delta: Int) {
+        var arr = s.wrappedValue.symbols
+        guard let i = arr.firstIndex(where: { $0.id == id }), arr.indices.contains(i + delta) else { return }
+        arr.swapAt(i, i + delta)
+        s.wrappedValue.symbols = arr
     }
 
     func scheduleSearch(_ text: String) {
@@ -283,7 +297,7 @@ struct GeneralTab: View {
                 if let e = state.lastError { Text("最近一次错误：" + e).font(.caption).foregroundStyle(.red) }
             }
             Section("关于") {
-                Text("小条 1.1。桌面隐蔽行情条。").font(.caption).foregroundStyle(.secondary)
+                Text("小条 1.2。桌面隐蔽行情条。").font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
